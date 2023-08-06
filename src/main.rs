@@ -49,9 +49,52 @@ bind_interrupts!(struct Irqs {
     I2C1_IRQ => InterruptHandler<I2C1>;
 });
 
-static RECORD_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-static IDLE_LED: Mutex<CriticalSectionRawMutex, Option<Output<'static, PIN_16>>> = Mutex::new(None);
-static RECORDING_LED: Mutex<CriticalSectionRawMutex, Option<Output<'static, PIN_17>>> = Mutex::new(None);
+static STATE_CONTROLLER: Mutex<CriticalSectionRawMutex, Option<StateController>> = Mutex::new(None);
+
+#[derive(Debug, PartialEq, Eq)]
+enum LoggerState {
+    Idle,
+    Recording,
+}
+struct StateController {
+    idle_led: Output<'static, PIN_16>,
+    recording_led: Output<'static, PIN_17>,
+    state: LoggerState,
+}
+
+impl StateController {
+    pub fn new(
+        idle_led: Output<'static, PIN_16>,
+        recording_led: Output<'static, PIN_17>) -> Self
+    {
+        Self {
+            idle_led,
+            recording_led,
+            state: LoggerState::Idle,
+        }
+    }
+
+    pub fn toggle_state(&mut self) {
+        self.idle_led.set_low();
+        self.recording_led.set_low();
+
+        match self.state {
+            LoggerState::Idle => self.state = LoggerState::Recording,
+            LoggerState::Recording => self.state = LoggerState::Idle,
+        }
+    }
+
+    pub fn toggle_led(&mut self) {
+        match self.state {
+            LoggerState::Idle => self.idle_led.toggle(),
+            LoggerState::Recording => self.recording_led.toggle(),
+        }
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.state == LoggerState::Recording
+    }
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -62,10 +105,10 @@ async fn main(spawner: Spawner) {
     let led1 = Output::new(p.PIN_16, Level::Low);
     let led2 = Output::new(p.PIN_17, Level::Low);
     let button = Input::new(p.PIN_18, gpio::Pull::Down);
-    // let err_led = Output::new(p.PIN_25, Level::Low);
 
-    let _ = IDLE_LED.lock().await.insert(led1);
-    let _ = RECORDING_LED.lock().await.insert(led2);
+    let _ = STATE_CONTROLLER.lock().await.insert(
+        StateController::new(led1, led2)
+    );
 
     let sda = p.PIN_14;
     let scl = p.PIN_15;
@@ -96,11 +139,7 @@ async fn control_recording(mut button: Input<'static, PIN_18>) {
         button.wait_for_falling_edge().await;
         // Arm thumbv6 doesn't support in place fetch and update
         // Locking will be added later
-        let cur = RECORD_IN_PROGRESS.load(Ordering::Relaxed);
-        RECORD_IN_PROGRESS.store(!cur, Ordering::Relaxed);
-
-        RECORDING_LED.lock().await.as_mut().unwrap().set_low();
-        IDLE_LED.lock().await.as_mut().unwrap().set_low();
+        STATE_CONTROLLER.lock().await.as_mut().unwrap().toggle_state();
     }
 }
 
@@ -108,11 +147,7 @@ async fn control_recording(mut button: Input<'static, PIN_18>) {
 async fn indicate_recording_state() {
     loop {
         Timer::after(Duration::from_millis(250)).await;
-        if RECORD_IN_PROGRESS.load(Ordering::Relaxed) {
-            RECORDING_LED.lock().await.as_mut().unwrap().toggle();
-        } else {
-            IDLE_LED.lock().await.as_mut().unwrap().toggle();
-        }
+        STATE_CONTROLLER.lock().await.as_mut().unwrap().toggle_led();
     }
 }
 
@@ -185,7 +220,7 @@ async fn collect_measurement(
             meas.magnetometer.z,
         ).unwrap();
 
-        if RECORD_IN_PROGRESS.load(Ordering::Relaxed) {
+        if STATE_CONTROLLER.lock().await.as_ref().unwrap().is_recording() {
             buffer.push_str(&message);
             idx = idx.saturating_add(1);
         }
