@@ -21,19 +21,17 @@ use {defmt_rtt as _, panic_probe as _};
 
 mod sensor;
 
-use sensor::lsm303d::lsm303d::{
+use sensor::lsm303d::{lsm303d::{
     LSM303D,
     Measurements,
-};
+}, configuration::{Configuration, MagnetometerResolution}};
 
-use sensor::lsm303d::configuration::{MagnetometerConfiguration,
+use sensor::lsm303d::configuration::{
     MagnetometerDataRate,
     MagneticSensorMode,
     MagnetometerFullScale,
-    AccelerometerConfiguration,
     AccelerationDataRate,
     AccelerationFullScale,
-    InternalTemperatureConfiguration, 
 };
 
 use state_controller::StateController;
@@ -100,9 +98,9 @@ async fn main(spawner: Spawner) {
 async fn control_recording(mut button: Input<'static, PIN_18>) {
     loop {
         button.wait_for_falling_edge().await;
-        // Arm thumbv6 doesn't support in place fetch and update
-        // Locking will be added later
         STATE_CONTROLLER.lock().await.as_mut().unwrap().toggle_state();
+
+        // todo: Add generating next filename
     }
 }
 
@@ -140,27 +138,31 @@ async fn collect_measurement(
     volume_mgr.close_file(&volume0, my_file).unwrap();
 
     let mut lsm303d = LSM303D::new(i2c);
+    lsm303d.configure(
+        Configuration::default()
+            .configure_accelerometer(
+                true,
+                true,
+                true,
+                AccelerationDataRate::Hz50,
+                AccelerationFullScale::Acc2G,
+            )
+            .configure_magnetometer(
+                MagnetometerDataRate::Hz50,
+                MagneticSensorMode::ContinuousConversion,
+                MagnetometerFullScale::Mag2Gauss,
+                MagnetometerResolution::Low,
+            )
+            .configure_temperature(
+                true,
+            )
+        ).unwrap();
     lsm303d.check_connection().unwrap();
-    lsm303d.configure_magnetometer(MagnetometerConfiguration {
-        data_rate: MagnetometerDataRate::Hz50,
-        mode: MagneticSensorMode::ContinuousConversion,
-        scale: MagnetometerFullScale::Mag2Gauss,
-    }).unwrap();
-    lsm303d.configure_accelerometer(AccelerometerConfiguration {
-        axis_x: true,
-        axis_y: true,
-        axis_z: true,
-        data_rate: AccelerationDataRate::Hz50,
-        scale: AccelerationFullScale::Acc2G,
-    }).unwrap();
-    lsm303d.configure_internal_temperature(
-        InternalTemperatureConfiguration { active: true }
-    ).unwrap();
 
     let mut message = ArrayString::<255>::new();
-    let now = Instant::now();
-
     let mut buffer = ArrayString::<2550>::new();
+
+    let now = Instant::now();
 
     let mut idx: u8 = 0;
 
@@ -175,15 +177,16 @@ async fn collect_measurement(
             buffer.push_str(&message);
             idx = idx.saturating_add(1);
         }
+
         if idx == 10 {
-            let mut my_file = volume_mgr.open_file_in_dir(
+            let mut csv_file = volume_mgr.open_file_in_dir(
                 &mut volume0,
                 &root_dir,
                 "data_1.csv",
                 embedded_sdmmc::Mode::ReadWriteAppend,
             ).unwrap();
-            volume_mgr.write(&mut volume0, &mut my_file, buffer.as_str().as_bytes()).unwrap();
-            volume_mgr.close_file(&mut volume0, my_file).unwrap();
+            volume_mgr.write(&mut volume0, &mut csv_file, buffer.as_str().as_bytes()).unwrap();
+            volume_mgr.close_file(&mut volume0, csv_file).unwrap();
             idx = 0;
             buffer.clear();
             uart.blocking_write("FLUSH!\r\n".as_bytes()).unwrap();

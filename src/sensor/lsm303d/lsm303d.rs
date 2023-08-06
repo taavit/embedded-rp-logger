@@ -1,6 +1,6 @@
 use embedded_hal::blocking::i2c::{WriteRead, Write, Read};
 
-use super::configuration::{InternalTemperatureConfiguration, AccelerometerConfiguration, AccelerationFullScale, MagnetometerConfiguration, MagnetometerFullScale};
+use super::configuration::Configuration;
 
 static ADDRESS: u8 = 0x1D;
 
@@ -74,87 +74,21 @@ where I2C: WriteRead + Write + Read {
         }
     }
 
+    pub fn configure(&mut self, configuration: Configuration) -> Result<(), ()> {
+        self.i2c.write(self.address, &[Register::Ctrl1 as u8, configuration.as_ctrl1()]).map_err(|_| ())?;
+        self.i2c.write(self.address, &[Register::Ctrl2 as u8, configuration.as_ctrl2()]).map_err(|_| ())?;
+        self.i2c.write(self.address, &[Register::Ctrl5 as u8, configuration.as_ctrl5()]).map_err(|_| ())?;
+        self.i2c.write(self.address, &[Register::Ctrl6 as u8, configuration.as_ctrl6()]).map_err(|_| ())?;
+        self.i2c.write(self.address, &[Register::Ctrl7 as u8, configuration.as_ctrl7()]).map_err(|_| ())?;
+
+        Ok(())
+    }
+
     pub fn check_connection(&mut self) -> Result<bool, ()> {
         let mut buffer = [0u8; 1];
         self.i2c.write_read(self.address,&[Register::WhoAmI as u8], &mut buffer).map_err(|_| ())?;
 
         Ok(buffer[0] == 0b01001001)
-    }
-
-    pub fn configure_internal_temperature(&mut self, configuration: InternalTemperatureConfiguration) -> Result<(), ()> {
-        let mut buffer = [0u8; 1];
-        self.i2c.write_read(self.address, &[Register::Ctrl5 as u8], &mut buffer).map_err(|_| ())?;
-        if configuration.active {
-            buffer[0] |= 0x80; 
-        } else {
-            buffer[0] &= !0x80; 
-        }
-        self.i2c.write(self.address, &[Register::Ctrl5 as u8, buffer[0]]).map_err(|_| ())?;
-
-        Ok(())
-    }
-
-    pub fn configure_accelerometer(&mut self, configuration: AccelerometerConfiguration) -> Result<(), ()> {
-        let mut buffer = [0u8; 1];
-        self.i2c
-            .write_read(
-                self.address, 
-                &[Register::Ctrl1 as u8],
-                &mut buffer
-            )
-            .map_err(|_| ())?;
-        cond_toggle_mask(configuration.axis_x, &mut buffer[0], 0x01);
-        cond_toggle_mask(configuration.axis_y, &mut buffer[0], 0x02);
-        cond_toggle_mask(configuration.axis_z, &mut buffer[0], 0x04);
-
-        buffer[0] &= 0b0000_1111; // Reset mask
-        buffer[0] |= configuration.data_rate as u8;
-
-        self.i2c.write(self.address, &[Register::Ctrl1 as u8, buffer[0]]).map_err(|_| ())?;
-
-        self.i2c.write_read(self.address, &[Register::Ctrl2 as u8], &mut buffer).map_err(|_| ())?;
-
-        buffer[0] &= 0b0011_1000; // Reset mask
-        buffer[0] |= configuration.scale as u8;
-        self.i2c.write(self.address, &[Register::Ctrl2 as u8, buffer[0]]).map_err(|_| ())?;
-
-        match configuration.scale {
-            AccelerationFullScale::Acc16G => self.acc_divider = 16.0,
-            AccelerationFullScale::Acc8G => self.acc_divider = 8.0,
-            AccelerationFullScale::Acc6G => self.acc_divider = 6.0,
-            AccelerationFullScale::Acc4G => self.acc_divider = 4.0,
-            AccelerationFullScale::Acc2G => self.acc_divider = 2.0,
-        }
-
-        Ok(())
-    }
-
-    pub fn configure_magnetometer(&mut self, configuration: MagnetometerConfiguration) -> Result<(), ()> {
-        let mut buffer = [0u8; 1];
-        self.i2c.write_read(self.address, &[Register::Ctrl5 as u8], &mut buffer).map_err(|_| ())?;
-
-        buffer[0] &= 0b0001_1100; // Reset mask
-        buffer[0] |= configuration.data_rate as u8;
-
-        self.i2c.write(self.address, &[Register::Ctrl5 as u8, buffer[0]]).map_err(|_| ())?;
-
-        buffer[0] = configuration.scale as u8;
-        self.i2c.write(self.address, &[Register::Ctrl6 as u8, buffer[0]]).map_err(|_| ())?;
-
-        self.i2c.write_read(self.address, &[Register::Ctrl7 as u8], &mut buffer).map_err(|_| ())?;
-        buffer[0] &= 0b1111_1100;
-        buffer[0] |= configuration.mode as u8;
-
-        self.i2c.write(self.address, &[Register::Ctrl7 as u8, buffer[0]]).map_err(|_| ())?;
-
-        match configuration.scale {
-            MagnetometerFullScale::Mag2Gauss => self.mag_divider = 2.0,
-            MagnetometerFullScale::Mag4Gauss => self.mag_divider = 4.0,
-            MagnetometerFullScale::Mag8Gauss => self.mag_divider = 8.0,
-            MagnetometerFullScale::Mag12Gauss => self.mag_divider = 12.0,
-        }
-
-        Ok(())
     }
 
     pub fn read_measurements(&mut self) -> Result<Measurements, ()> {
