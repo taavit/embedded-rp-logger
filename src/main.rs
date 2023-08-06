@@ -19,18 +19,23 @@ use embassy_sync::{mutex::Mutex, blocking_mutex::raw::CriticalSectionRawMutex};
 use embassy_time::{Duration, Timer, Instant, Delay};
 use {defmt_rtt as _, panic_probe as _};
 
-mod lsm303d;
-use lsm303d::{
+mod sensor;
+
+use sensor::lsm303d::lsm303d::{
     LSM303D,
-    MagnetometerConfiguration,
+    Measurements,
+};
+
+use sensor::lsm303d::configuration::{MagnetometerConfiguration,
     MagnetometerDataRate,
     MagneticSensorMode,
     MagnetometerFullScale,
     AccelerometerConfiguration,
     AccelerationDataRate,
     AccelerationFullScale,
-    InternalTemperatureConfiguration,
+    InternalTemperatureConfiguration, 
 };
+
 use state_controller::StateController;
 
 struct FakeTimesource();
@@ -130,7 +135,7 @@ async fn collect_measurement(
         &mut volume0,
         &root_dir,
         "data_1.csv",
-        embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
+        embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
     ).unwrap();
     volume_mgr.close_file(&volume0, my_file).unwrap();
 
@@ -162,21 +167,9 @@ async fn collect_measurement(
     loop {
         Timer::after(Duration::from_millis(100)).await;
 
-        let meas = lsm303d.read_measurements().unwrap();
+        let measurements = lsm303d.read_measurements().unwrap();
 
-        message.clear();
-        writeln!(
-            &mut message,
-            "{:6},{:+3.4},{:+3.4},{:+3.4},{:+3.3},{:+4.3},{:+4.3}\r",
-            now.elapsed().as_millis(),
-            meas.accelerometer.x,
-            meas.accelerometer.y,
-            meas.accelerometer.z,
-
-            meas.magnetometer.x,
-            meas.magnetometer.y,
-            meas.magnetometer.z,
-        ).unwrap();
+        format_measurements(&mut message, &measurements, &now.elapsed());
 
         if STATE_CONTROLLER.lock().await.as_ref().unwrap().is_recording() {
             buffer.push_str(&message);
@@ -198,4 +191,24 @@ async fn collect_measurement(
 
         uart.blocking_write(message.as_bytes()).unwrap();
     }
+}
+
+fn format_measurements<const SIZE: usize>(
+    mut message: &mut ArrayString<SIZE>,
+    measurements: &Measurements,
+    elapsed: &Duration,
+) {
+    message.clear();
+    writeln!(
+        &mut message,
+        "{:6},{:+3.4},{:+3.4},{:+3.4},{:+3.3},{:+4.3},{:+4.3}\r",
+        elapsed.as_millis(),
+        measurements.accelerometer.x,
+        measurements.accelerometer.y,
+        measurements.accelerometer.z,
+
+        measurements.magnetometer.x,
+        measurements.magnetometer.y,
+        measurements.magnetometer.z,
+    ).unwrap();
 }
