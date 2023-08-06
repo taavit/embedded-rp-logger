@@ -2,22 +2,24 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
-use core::{fmt::Write, sync::atomic::{AtomicBool, Ordering}};
+mod state_controller;
+
+use core::fmt::Write;
 use arrayvec::ArrayString;
 use embassy_executor::Spawner;
 use embassy_rp::{
-    gpio::{Input, Output, Level, self},
+    gpio::{Input, Output, Level, self, Pin},
     uart::{Uart, Blocking, self},
     i2c::{InterruptHandler, I2c, Async, Config, self},
     spi::{self, Spi},
     bind_interrupts,
-    peripherals::{I2C1, PIN_17, PIN_16, PIN_18, UART0, SPI1, PIN_13}, Peripheral};
+    peripherals::{I2C1, PIN_18, UART0, SPI1, PIN_13}
+};
 use embassy_sync::{mutex::Mutex, blocking_mutex::raw::CriticalSectionRawMutex};
 use embassy_time::{Duration, Timer, Instant, Delay};
 use {defmt_rtt as _, panic_probe as _};
 
 mod lsm303d;
-use embedded_sdmmc::SdCard;
 use lsm303d::{
     LSM303D,
     MagnetometerConfiguration,
@@ -27,8 +29,9 @@ use lsm303d::{
     AccelerometerConfiguration,
     AccelerationDataRate,
     AccelerationFullScale,
-    InternalTemperatureConfiguration, Measurements,
+    InternalTemperatureConfiguration,
 };
+use state_controller::StateController;
 
 struct FakeTimesource();
 
@@ -51,59 +54,14 @@ bind_interrupts!(struct Irqs {
 
 static STATE_CONTROLLER: Mutex<CriticalSectionRawMutex, Option<StateController>> = Mutex::new(None);
 
-#[derive(Debug, PartialEq, Eq)]
-enum LoggerState {
-    Idle,
-    Recording,
-}
-struct StateController {
-    idle_led: Output<'static, PIN_16>,
-    recording_led: Output<'static, PIN_17>,
-    state: LoggerState,
-}
-
-impl StateController {
-    pub fn new(
-        idle_led: Output<'static, PIN_16>,
-        recording_led: Output<'static, PIN_17>) -> Self
-    {
-        Self {
-            idle_led,
-            recording_led,
-            state: LoggerState::Idle,
-        }
-    }
-
-    pub fn toggle_state(&mut self) {
-        self.idle_led.set_low();
-        self.recording_led.set_low();
-
-        match self.state {
-            LoggerState::Idle => self.state = LoggerState::Recording,
-            LoggerState::Recording => self.state = LoggerState::Idle,
-        }
-    }
-
-    pub fn toggle_led(&mut self) {
-        match self.state {
-            LoggerState::Idle => self.idle_led.toggle(),
-            LoggerState::Recording => self.recording_led.toggle(),
-        }
-    }
-
-    pub fn is_recording(&self) -> bool {
-        self.state == LoggerState::Recording
-    }
-}
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let config = uart::Config::default();
     let uart = uart::Uart::new_blocking(p.UART0, p.PIN_0, p.PIN_1, config);
-    let led1 = Output::new(p.PIN_16, Level::Low);
-    let led2 = Output::new(p.PIN_17, Level::Low);
+    let led1 = Output::new(p.PIN_16.degrade(), Level::Low);
+    let led2 = Output::new(p.PIN_17.degrade(), Level::Low);
     let button = Input::new(p.PIN_18, gpio::Pull::Down);
 
     let _ = STATE_CONTROLLER.lock().await.insert(
@@ -174,7 +132,7 @@ async fn collect_measurement(
         "data_1.csv",
         embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
     ).unwrap();
-    volume_mgr.close_file(&mut volume0, my_file).unwrap();
+    volume_mgr.close_file(&volume0, my_file).unwrap();
 
     let mut lsm303d = LSM303D::new(i2c);
     lsm303d.check_connection().unwrap();

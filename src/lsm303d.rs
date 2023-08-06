@@ -254,21 +254,21 @@ where I2C: WriteRead + Write + Read {
             )
             .map_err(|_| ())?;
 
-        temperature = i16::from_le_bytes(buffer.try_into().unwrap());
+        temperature = i16::from_le_bytes(buffer);
 
         self.i2c.write_read(self.address, &[Register::OutXLA as u8 | 0x80], &mut buffer).map_err(|_| ())?;
-        acc_x = (f64::from(i16::from_le_bytes(buffer.try_into().unwrap())) * self.acc_divider) / 32678.0;
+        acc_x = (f64::from(i16::from_le_bytes(buffer)) * self.acc_divider) / 32678.0;
         self.i2c.write_read(self.address, &[Register::OutYLA as u8 | 0x80], &mut buffer).map_err(|_| ())?;
-        acc_y = (f64::from(i16::from_le_bytes(buffer.try_into().unwrap())) * self.acc_divider) / 32678.0;
+        acc_y = (f64::from(i16::from_le_bytes(buffer)) * self.acc_divider) / 32678.0;
         self.i2c.write_read(self.address, &[Register::OutZLA as u8 | 0x80], &mut buffer).map_err(|_| ())?;
-        acc_z = (f64::from(i16::from_le_bytes(buffer.try_into().unwrap())) * self.acc_divider) / 32678.0;
+        acc_z = (f64::from(i16::from_le_bytes(buffer)) * self.acc_divider) / 32678.0;
 
         self.i2c.write_read(self.address, &[Register::OutXLM as u8 | 0x80], &mut buffer).map_err(|_| ())?;
-        mag_x = (f64::from(i16::from_le_bytes(buffer.try_into().unwrap())) * self.mag_divider) / 32678.0;
+        mag_x = (f64::from(i16::from_le_bytes(buffer)) * self.mag_divider) / 32678.0;
         self.i2c.write_read(self.address, &[Register::OutYLM as u8 | 0x80], &mut buffer).map_err(|_| ())?;
-        mag_y = (f64::from(i16::from_le_bytes(buffer.try_into().unwrap())) * self.mag_divider) / 32678.0;
+        mag_y = (f64::from(i16::from_le_bytes(buffer)) * self.mag_divider) / 32678.0;
         self.i2c.write_read(self.address, &[Register::OutZLM as u8 | 0x80], &mut buffer).map_err(|_| ())?;
-        mag_z = (f64::from(i16::from_le_bytes(buffer.try_into().unwrap())) * self.mag_divider) / 32678.0;
+        mag_z = (f64::from(i16::from_le_bytes(buffer)) * self.mag_divider) / 32678.0;
 
         Ok(Measurements {
             temperature: temperature.into(),
