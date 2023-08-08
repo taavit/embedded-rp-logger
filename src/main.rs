@@ -8,14 +8,17 @@ use core::fmt::Write;
 use arrayvec::ArrayString;
 use embassy_executor::Spawner;
 use embassy_rp::{
-    gpio::{Input, Output, Level, self, Pin},
+    gpio::{Input, Output, Level, self, Pin, AnyPin},
     uart::{Uart, Blocking, self},
     i2c::{InterruptHandler, I2c, Async, Config, self},
     spi::{self, Spi},
     bind_interrupts,
     peripherals::{I2C1, PIN_18, UART0, SPI1, PIN_13}
 };
-use embassy_sync::{mutex::Mutex, blocking_mutex::raw::CriticalSectionRawMutex, pubsub::{PubSubChannel, Subscriber, publisher, Publisher}};
+use embassy_sync::{
+    mutex::Mutex,
+    blocking_mutex::raw::CriticalSectionRawMutex,
+    pubsub::{PubSubChannel, Subscriber, Publisher}};
 use embassy_time::{Duration, Timer, Instant, Delay};
 use {defmt_rtt as _, panic_probe as _};
 
@@ -34,7 +37,7 @@ use sensor::lsm303d::configuration::{
     AccelerationFullScale,
 };
 
-use state_controller::StateController;
+use state_controller::{StateController, LoggerState};
 
 struct FakeTimesource();
 
@@ -51,12 +54,22 @@ impl embedded_sdmmc::TimeSource for FakeTimesource {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RecorderCommand {
+    NewMeasurement(Duration, Measurements),
+    StartRecording,
+    StopRecording,
+}
+
 bind_interrupts!(struct Irqs {
     I2C1_IRQ => InterruptHandler<I2C1>;
 });
 
-static STATE_CONTROLLER: Mutex<CriticalSectionRawMutex, Option<StateController>> = Mutex::new(None);
-static DATA_QUEUE: PubSubChannel<CriticalSectionRawMutex, (Duration, Measurements), 5, 2, 1> = PubSubChannel::new();
+const SUBSCRIBER_NO: usize = 2;
+const PUBLISHER_NO: usize = 2;
+
+static STATE_CONTROLLER: Mutex<CriticalSectionRawMutex, StateController> = Mutex::new(StateController { state: LoggerState::Idle });
+static DATA_QUEUE: PubSubChannel<CriticalSectionRawMutex, RecorderCommand, 5, SUBSCRIBER_NO, PUBLISHER_NO> = PubSubChannel::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -67,10 +80,6 @@ async fn main(spawner: Spawner) {
     let led1 = Output::new(p.PIN_16.degrade(), Level::Low);
     let led2 = Output::new(p.PIN_17.degrade(), Level::Low);
     let button = Input::new(p.PIN_18, gpio::Pull::Down);
-
-    let _ = STATE_CONTROLLER.lock().await.insert(
-        StateController::new(led1, led2)
-    );
 
     let sda = p.PIN_14;
     let scl = p.PIN_15;
@@ -87,8 +96,13 @@ async fn main(spawner: Spawner) {
         spi::Config::default(),
     );
 
-    spawner.spawn(control_recording(button)).unwrap();
-    spawner.spawn(indicate_recording_state()).unwrap();
+    spawner.spawn(
+        control_recording(
+            button,
+            DATA_QUEUE.publisher().unwrap()
+        )
+    ).unwrap();
+    spawner.spawn(state_observer(led1, led2)).unwrap();
     spawner.spawn(collect_measurement(
         i2c,
         DATA_QUEUE.publisher().unwrap(),
@@ -110,27 +124,55 @@ async fn main(spawner: Spawner) {
 }
 
 #[embassy_executor::task]
-async fn control_recording(mut button: Input<'static, PIN_18>) {
+async fn control_recording(
+    mut button: Input<'static, PIN_18>,
+    publisher: Publisher<
+        'static,
+        CriticalSectionRawMutex,
+        RecorderCommand,
+        5,
+        SUBSCRIBER_NO,
+        PUBLISHER_NO
+    >
+) {
     loop {
         button.wait_for_falling_edge().await;
-        STATE_CONTROLLER.lock().await.as_mut().unwrap().toggle_state();
-
-        // todo: Add generating next filename
+        let mut current_state = STATE_CONTROLLER.lock().await;
+        if current_state.is_recording() {
+            current_state.transition(LoggerState::Idle);
+            publisher.publish(RecorderCommand::StopRecording).await;
+        } else {
+            current_state.transition(LoggerState::Recording);
+            publisher.publish(RecorderCommand::StartRecording).await;
+        }
     }
 }
 
 #[embassy_executor::task]
-async fn indicate_recording_state() {
+async fn state_observer(
+    mut green_led: Output<'static, AnyPin>,
+    mut red_led: Output<'static, AnyPin>,
+) {
     loop {
-        Timer::after(Duration::from_millis(250)).await;
-        STATE_CONTROLLER.lock().await.as_mut().unwrap().toggle_led();
+        let is_recording = STATE_CONTROLLER.lock().await.is_recording();
+        if is_recording {
+            red_led.set_high();
+            Timer::after(Duration::from_millis(125)).await;
+            red_led.set_low();
+            Timer::after(Duration::from_millis(125)).await;
+        } else {
+            green_led.set_high();
+            Timer::after(Duration::from_millis(125)).await;
+            green_led.set_low();
+            Timer::after(Duration::from_millis(125)).await;
+        }
     }
 }
 
 #[embassy_executor::task]
 async fn collect_measurement(
     i2c: I2c<'static, I2C1, Async>,
-    publisher: Publisher<'static, CriticalSectionRawMutex, (Duration, Measurements), 5, 2, 1>,
+    publisher: Publisher<'static, CriticalSectionRawMutex, RecorderCommand, 5, SUBSCRIBER_NO, PUBLISHER_NO>,
 ) {
     let mut lsm303d = LSM303D::new(i2c);
     lsm303d.configure(
@@ -159,22 +201,26 @@ async fn collect_measurement(
     loop {
         Timer::after(Duration::from_millis(100)).await;
         let measurements = lsm303d.read_measurements().unwrap();
-        publisher.publish((now.elapsed(), measurements)).await;
+        publisher.publish(RecorderCommand::NewMeasurement(now.elapsed(), measurements)).await;
     }
 }
 
 #[embassy_executor::task]
 async fn write_to_uart(
     mut uart: Uart<'static, UART0, Blocking>,
-    mut subscriber: Subscriber<'static, CriticalSectionRawMutex, (Duration, Measurements), 5, 2, 1>,
+    mut subscriber: Subscriber<'static, CriticalSectionRawMutex, RecorderCommand, 5, SUBSCRIBER_NO, PUBLISHER_NO>,
 ) {
     let mut buffer = ArrayString::<80>::new();
 
     loop {
-        let (elapsed, measurements) = subscriber.next_message_pure().await;
-        buffer.clear();
-        format_measurements(&mut buffer, &measurements, &elapsed);
-        uart.blocking_write(buffer.as_str().as_bytes()).unwrap();
+        match subscriber.next_message_pure().await {
+            RecorderCommand::NewMeasurement(elapsed, measurements) => {
+                buffer.clear();
+                format_measurements(&mut buffer, &measurements, &elapsed);
+                uart.blocking_write(buffer.as_str().as_bytes()).unwrap();
+            }
+            _ => {},
+        }
     }
 }
 
@@ -182,7 +228,14 @@ async fn write_to_uart(
 async fn write_to_sdcard(
     spi: Spi<'static, SPI1, spi::Async>,
     sd_cs: Output<'static, PIN_13>,
-    mut subscriber: Subscriber<'static, CriticalSectionRawMutex, (Duration, Measurements), 5, 2, 1>,
+    mut subscriber: Subscriber<
+        'static,
+        CriticalSectionRawMutex,
+        RecorderCommand,
+        5,
+        SUBSCRIBER_NO,
+        PUBLISHER_NO
+    >,
 ) {
     let sdcard = embedded_sdmmc::SdCard::new(
         spi,
@@ -208,25 +261,30 @@ async fn write_to_sdcard(
     let mut idx: u8 = 0;
 
     loop {
-        let (elapsed, measurements) = subscriber.next_message_pure().await;
-        format_measurements(&mut message, &measurements, &elapsed);
+        match subscriber.next_message_pure().await {
+            RecorderCommand::NewMeasurement(elapsed, measurements) => {
+                format_measurements(&mut message, &measurements, &elapsed);
 
-        if STATE_CONTROLLER.lock().await.as_ref().unwrap().is_recording() {
-            buffer.push_str(&message);
-            idx = idx.saturating_add(1);
-        }
+                if STATE_CONTROLLER.lock().await.is_recording() {
+                    buffer.push_str(&message);
+                    idx = idx.saturating_add(1);
+                }
 
-        if idx == 10 {
-            let mut csv_file = volume_mgr.open_file_in_dir(
-                &mut volume0,
-                &root_dir,
-                "data_1.csv",
-                embedded_sdmmc::Mode::ReadWriteAppend,
-            ).unwrap();
-            volume_mgr.write(&mut volume0, &mut csv_file, buffer.as_str().as_bytes()).unwrap();
-            volume_mgr.close_file(&mut volume0, csv_file).unwrap();
-            idx = 0;
-            buffer.clear();
+                if idx == 10 {
+                    let mut csv_file = volume_mgr.open_file_in_dir(
+                        &mut volume0,
+                        &root_dir,
+                        "data_1.csv",
+                        embedded_sdmmc::Mode::ReadWriteAppend,
+                    ).unwrap();
+                    volume_mgr.write(&mut volume0, &mut csv_file, buffer.as_str().as_bytes()).unwrap();
+                    volume_mgr.close_file(&mut volume0, csv_file).unwrap();
+                    idx = 0;
+                    buffer.clear();
+                }
+            },
+            RecorderCommand::StartRecording => {},
+            RecorderCommand::StopRecording => {},
         }
     }
 }
