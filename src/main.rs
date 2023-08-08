@@ -15,7 +15,7 @@ use embassy_rp::{
     bind_interrupts,
     peripherals::{I2C1, PIN_18, UART0, SPI1, PIN_13}
 };
-use embassy_sync::{mutex::Mutex, blocking_mutex::raw::CriticalSectionRawMutex};
+use embassy_sync::{mutex::Mutex, blocking_mutex::raw::CriticalSectionRawMutex, pubsub::{PubSubChannel, Subscriber, publisher, Publisher}};
 use embassy_time::{Duration, Timer, Instant, Delay};
 use {defmt_rtt as _, panic_probe as _};
 
@@ -56,6 +56,7 @@ bind_interrupts!(struct Irqs {
 });
 
 static STATE_CONTROLLER: Mutex<CriticalSectionRawMutex, Option<StateController>> = Mutex::new(None);
+static DATA_QUEUE: PubSubChannel<CriticalSectionRawMutex, (Duration, Measurements), 5, 2, 1> = PubSubChannel::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -88,7 +89,21 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(control_recording(button)).unwrap();
     spawner.spawn(indicate_recording_state()).unwrap();
-    spawner.spawn(collect_measurement(i2c, uart, spi, Output::new(p.PIN_13, Level::Low))).unwrap();
+    spawner.spawn(collect_measurement(
+        i2c,
+        DATA_QUEUE.publisher().unwrap(),
+    )).unwrap();
+    spawner.spawn(write_to_uart(
+        uart,
+        DATA_QUEUE.subscriber().unwrap()
+    )).unwrap();
+    spawner.spawn(
+        write_to_sdcard(
+            spi,
+            Output::new(p.PIN_13, Level::Low),
+            DATA_QUEUE.subscriber().unwrap()
+        )
+    ).unwrap();
     loop {
         Timer::after(Duration::from_millis(1000)).await;
     }
@@ -115,28 +130,8 @@ async fn indicate_recording_state() {
 #[embassy_executor::task]
 async fn collect_measurement(
     i2c: I2c<'static, I2C1, Async>,
-    mut uart: Uart<'static, UART0, Blocking>,
-    spi: Spi<'static, SPI1, spi::Async>,
-    sd_cs: Output<'static, PIN_13>,
+    publisher: Publisher<'static, CriticalSectionRawMutex, (Duration, Measurements), 5, 2, 1>,
 ) {
-    let sdcard = embedded_sdmmc::SdCard::new(
-        spi,
-        sd_cs,
-        Delay,
-    );
-
-    let mut volume_mgr = embedded_sdmmc::VolumeManager::new(sdcard, FakeTimesource {});
-
-    let mut volume0 = volume_mgr.get_volume(embedded_sdmmc::VolumeIdx(0)).unwrap();
-    let root_dir = volume_mgr.open_root_dir(&volume0).unwrap();
-    let my_file = volume_mgr.open_file_in_dir(
-        &mut volume0,
-        &root_dir,
-        "data_1.csv",
-        embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
-    ).unwrap();
-    volume_mgr.close_file(&volume0, my_file).unwrap();
-
     let mut lsm303d = LSM303D::new(i2c);
     lsm303d.configure(
         Configuration::default()
@@ -159,19 +154,62 @@ async fn collect_measurement(
         ).unwrap();
     lsm303d.check_connection().unwrap();
 
+    let now = Instant::now();
+
+    loop {
+        Timer::after(Duration::from_millis(100)).await;
+        let measurements = lsm303d.read_measurements().unwrap();
+        publisher.publish((now.elapsed(), measurements)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn write_to_uart(
+    mut uart: Uart<'static, UART0, Blocking>,
+    mut subscriber: Subscriber<'static, CriticalSectionRawMutex, (Duration, Measurements), 5, 2, 1>,
+) {
+    let mut buffer = ArrayString::<80>::new();
+
+    loop {
+        let (elapsed, measurements) = subscriber.next_message_pure().await;
+        buffer.clear();
+        format_measurements(&mut buffer, &measurements, &elapsed);
+        uart.blocking_write(buffer.as_str().as_bytes()).unwrap();
+    }
+}
+
+#[embassy_executor::task]
+async fn write_to_sdcard(
+    spi: Spi<'static, SPI1, spi::Async>,
+    sd_cs: Output<'static, PIN_13>,
+    mut subscriber: Subscriber<'static, CriticalSectionRawMutex, (Duration, Measurements), 5, 2, 1>,
+) {
+    let sdcard = embedded_sdmmc::SdCard::new(
+        spi,
+        sd_cs,
+        Delay,
+    );
+
+    let mut volume_mgr = embedded_sdmmc::VolumeManager::new(sdcard, FakeTimesource {});
+
+    let mut volume0 = volume_mgr.get_volume(embedded_sdmmc::VolumeIdx(0)).unwrap();
+    let root_dir = volume_mgr.open_root_dir(&volume0).unwrap();
+    let my_file = volume_mgr.open_file_in_dir(
+        &mut volume0,
+        &root_dir,
+        "data_1.csv",
+        embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+    ).unwrap();
+    volume_mgr.close_file(&volume0, my_file).unwrap();
+
     let mut message = ArrayString::<255>::new();
     let mut buffer = ArrayString::<2550>::new();
-
-    let now = Instant::now();
 
     let mut idx: u8 = 0;
 
     loop {
-        Timer::after(Duration::from_millis(100)).await;
-
-        let measurements = lsm303d.read_measurements().unwrap();
-
-        format_measurements(&mut message, &measurements, &now.elapsed());
+        let (elapsed, measurements) = subscriber.next_message_pure().await;
+        format_measurements(&mut message, &measurements, &elapsed);
 
         if STATE_CONTROLLER.lock().await.as_ref().unwrap().is_recording() {
             buffer.push_str(&message);
@@ -189,10 +227,7 @@ async fn collect_measurement(
             volume_mgr.close_file(&mut volume0, csv_file).unwrap();
             idx = 0;
             buffer.clear();
-            uart.blocking_write("FLUSH!\r\n".as_bytes()).unwrap();
         }
-
-        uart.blocking_write(message.as_bytes()).unwrap();
     }
 }
 
