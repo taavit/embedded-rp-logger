@@ -136,7 +136,12 @@ async fn control_recording(
     >
 ) {
     loop {
+        button.wait_for_rising_edge().await;
+        let now = Instant::now();
         button.wait_for_falling_edge().await;
+        if now.elapsed() < Duration::from_millis(100) {
+            continue;
+        }
         let mut current_state = STATE_CONTROLLER.lock().await;
         if current_state.is_recording() {
             current_state.transition(LoggerState::Idle);
@@ -154,17 +159,28 @@ async fn state_observer(
     mut red_led: Output<'static, AnyPin>,
 ) {
     loop {
-        let is_recording = STATE_CONTROLLER.lock().await.is_recording();
-        if is_recording {
-            red_led.set_high();
-            Timer::after(Duration::from_millis(125)).await;
-            red_led.set_low();
-            Timer::after(Duration::from_millis(125)).await;
-        } else {
-            green_led.set_high();
-            Timer::after(Duration::from_millis(125)).await;
-            green_led.set_low();
-            Timer::after(Duration::from_millis(125)).await;
+        let state = STATE_CONTROLLER.lock().await.state;
+        match state {
+            LoggerState::Idle => {
+                green_led.set_high();
+                Timer::after(Duration::from_millis(125)).await;
+                green_led.set_low();
+                Timer::after(Duration::from_millis(125)).await;
+            },
+            LoggerState::Recording => {
+                red_led.set_high();
+                Timer::after(Duration::from_millis(125)).await;
+                red_led.set_low();
+                Timer::after(Duration::from_millis(125)).await;
+            }
+            LoggerState::Resetting => {
+                red_led.set_high();
+                green_led.set_high();
+                Timer::after(Duration::from_millis(50)).await;
+                red_led.set_low();
+                green_led.set_low();
+                Timer::after(Duration::from_millis(50)).await;
+            }
         }
     }
 }
@@ -208,7 +224,14 @@ async fn collect_measurement(
 #[embassy_executor::task]
 async fn write_to_uart(
     mut uart: Uart<'static, UART0, Blocking>,
-    mut subscriber: Subscriber<'static, CriticalSectionRawMutex, RecorderCommand, 5, SUBSCRIBER_NO, PUBLISHER_NO>,
+    mut subscriber: Subscriber<
+        'static,
+        CriticalSectionRawMutex,
+        RecorderCommand,
+        5,
+        SUBSCRIBER_NO,
+        PUBLISHER_NO,
+    >,
 ) {
     let mut buffer = ArrayString::<80>::new();
 
@@ -247,46 +270,75 @@ async fn write_to_sdcard(
 
     let mut volume0 = volume_mgr.get_volume(embedded_sdmmc::VolumeIdx(0)).unwrap();
     let root_dir = volume_mgr.open_root_dir(&volume0).unwrap();
-    let my_file = volume_mgr.open_file_in_dir(
-        &mut volume0,
-        &root_dir,
-        "data_1.csv",
-        embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
-    ).unwrap();
-    volume_mgr.close_file(&volume0, my_file).unwrap();
 
-    let mut message = ArrayString::<255>::new();
-    let mut buffer = ArrayString::<2550>::new();
+    let mut message = ArrayString::<80>::new();
+    let mut buffer = ArrayString::<800>::new();
+    let mut filename = ArrayString::<16>::new();
 
-    let mut idx: u8 = 0;
+    let mut buffer_idx: u8 = 0;
+    let mut filename_idx: usize = 0;
+    update_filename(&mut filename, filename_idx);
+    let mut recording: bool = STATE_CONTROLLER.lock().await.is_recording();
 
     loop {
         match subscriber.next_message_pure().await {
             RecorderCommand::NewMeasurement(elapsed, measurements) => {
                 format_measurements(&mut message, &measurements, &elapsed);
 
-                if STATE_CONTROLLER.lock().await.is_recording() {
+                if recording {
                     buffer.push_str(&message);
-                    idx = idx.saturating_add(1);
+                    buffer_idx = buffer_idx.saturating_add(1);
                 }
 
-                if idx == 10 {
+                if buffer_idx == 10 {
                     let mut csv_file = volume_mgr.open_file_in_dir(
                         &mut volume0,
                         &root_dir,
-                        "data_1.csv",
+                        filename.as_str(),
                         embedded_sdmmc::Mode::ReadWriteAppend,
                     ).unwrap();
                     volume_mgr.write(&mut volume0, &mut csv_file, buffer.as_str().as_bytes()).unwrap();
                     volume_mgr.close_file(&mut volume0, csv_file).unwrap();
-                    idx = 0;
+                    buffer_idx = 0;
                     buffer.clear();
                 }
             },
-            RecorderCommand::StartRecording => {},
-            RecorderCommand::StopRecording => {},
+            RecorderCommand::StartRecording => {
+                let my_file = volume_mgr.open_file_in_dir(
+                    &mut volume0,
+                    &root_dir,
+                    filename.as_str(),
+                    embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+                ).unwrap();
+                volume_mgr.close_file(&volume0, my_file).unwrap();
+                recording = true;
+            },
+            RecorderCommand::StopRecording => {
+                recording = false;
+                let mut csv_file = volume_mgr.open_file_in_dir(
+                    &mut volume0,
+                    &root_dir,
+                    filename.as_str(),
+                    embedded_sdmmc::Mode::ReadWriteAppend,
+                ).unwrap();
+                volume_mgr.write(&mut volume0, &mut csv_file, buffer.as_str().as_bytes()).unwrap();
+                volume_mgr.close_file(&mut volume0, csv_file).unwrap();
+                buffer_idx = 0;
+                buffer.clear();
+
+                filename_idx += 1;
+                update_filename(&mut filename, filename_idx);
+            },
         }
     }
+}
+
+fn update_filename<const SIZE: usize>(
+    message: &mut ArrayString<SIZE>,
+    idx: usize,
+) {
+    message.clear();
+    write!(message, "d_{:05}.csv", idx).unwrap();
 }
 
 fn format_measurements<const SIZE: usize>(

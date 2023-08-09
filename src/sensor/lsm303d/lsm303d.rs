@@ -142,11 +142,3 @@ where I2C: WriteRead + Write + Read {
         })
     }
 }
-
-fn cond_toggle_mask(condition: bool, value: &mut u8, mask: u8) {
-    if condition {
-        *value |= mask; 
-    } else {
-        *value &= !mask; 
-    }
-}

@@ -2,6 +2,7 @@
 pub enum LoggerState {
     Idle,
     Recording,
+    Resetting,
 }
 pub struct StateController {
     pub state: LoggerState,
@@ -9,12 +10,6 @@ pub struct StateController {
 
 impl StateController
 {
-    pub fn new() -> Self {
-        Self {
-            state: LoggerState::Idle,
-        }
-    }
-
     pub fn transition(&mut self, state: LoggerState) {
         self.state = state;
     }
